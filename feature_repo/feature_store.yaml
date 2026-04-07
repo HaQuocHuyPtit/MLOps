@@ -1,0 +1,17 @@
+project: mlops_anomaly_detection
+provider: local
+registry:
+  registry_type: sql
+  path: postgresql+psycopg2://mlops:mlops_secret@localhost:5433/feast_registry
+offline_store:
+  type: postgres
+  host: localhost
+  port: 5433
+  database: feast_offline
+  db_schema: public
+  user: mlops
+  password: mlops_secret
+online_store:
+  type: redis
+  connection_string: localhost:6379
+entity_key_serialization_version: 3

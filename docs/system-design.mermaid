@@ -1,0 +1,91 @@
+flowchart TB
+    subgraph DS["① Data Sources"]
+        KP["Kafka Producer<br/><i>kafka_producer.py</i><br/>20 simulated transactions<br/>5% anomaly injection"]
+    end
+
+    subgraph KF["② Apache Kafka (KRaft)"]
+        TOPIC["Topic: transactions<br/>1 Partition · Port 9092<br/><i>mlops-kafka container</i>"]
+    end
+
+    subgraph ETL["③ ETL Pipeline"]
+        KC["Kafka Consumer<br/><i>kafka_consumer.py</i>"]
+        TR["Transform<br/>Clean · Type cast · Aggregate"]
+    end
+
+    subgraph PG["④ PostgreSQL (port 5433)"]
+        direction TB
+        PGDB1["DB: feast_registry<br/><i>Feature metadata (protobuf)</i>"]
+        PGDB2["DB: feast_offline<br/><i>Tables: transactions,<br/>customer_profiles</i>"]
+        PGDB3["DB: mlflow<br/><i>Experiments, runs,<br/>params, metrics</i>"]
+    end
+
+    subgraph REDIS["⑤ Redis (port 6379)"]
+        RCACHE["Online Feature Store<br/><i>Materialized features<br/>Low-latency key-value</i>"]
+    end
+
+    subgraph MINIO["⑥ MinIO (S3-compatible)"]
+        BUCKET["Bucket: mlflow-artifacts<br/><i>Model weights, scaler.pkl,<br/>threshold.pkl</i><br/>API: 9200 · UI: 9201"]
+    end
+
+    subgraph FEAST["⑦ Feast Feature Store"]
+        direction TB
+        FV1["Feature View<br/><b>transaction_features</b><br/>amount · hour · day<br/>is_online · distance"]
+        FV2["Feature View<br/><b>customer_profile_features</b><br/>avg/std/max amount<br/>total_txn · merchants"]
+        FS["Feature Service<br/><b>training_service</b><br/><b>serving_service</b>"]
+        ENTITY["Entity<br/><b>customer_id</b>"]
+        ENTITY --- FV1 & FV2
+        FV1 & FV2 --- FS
+    end
+
+    subgraph TRAIN["⑧ Model Training (Historical)"]
+        HF["get_historical_features()<br/><i>Point-in-time Join</i>"]
+        AE["PyTorch Autoencoder<br/>input→32→16→8→16→32→input"]
+        ML["MLflow Tracking<br/>Params · Metrics · Model Registry"]
+        HF --> AE --> ML
+    end
+
+    subgraph SERVE["⑨ Model Serving (Real-time)"]
+        API["Flask API<br/><i>Port 5001</i><br/>/predict · /predict/batch · /health"]
+        ONF["get_online_features()<br/><i>From Redis</i>"]
+        INF["Autoencoder Inference<br/><i>Loaded from MLflow + MinIO</i>"]
+        SCR["Anomaly Score<br/><i>reconstruction_error > threshold</i>"]
+        API --> ONF --> INF --> SCR
+    end
+
+    subgraph UI["⑩ Monitoring UIs"]
+        MLU["MLflow UI<br/><i>Port 5000</i><br/>Experiments · Models"]
+        FEU["Feast UI<br/><i>Port 8889</i><br/>Entities · Features"]
+        MIU["MinIO Console<br/><i>Port 9201</i><br/>Artifacts browser"]
+    end
+
+    %% Data flow
+    KP -->|"send()"| TOPIC
+    TOPIC -->|"consume()"| KC
+    KC --> TR
+    TR -->|"to_sql()"| PGDB2
+
+    %% Feast interactions
+    PGDB1 -.->|"registry"| FEAST
+    PGDB2 -->|"Offline retrieval"| HF
+    FV1 & FV2 -->|"feast materialize"| RCACHE
+    RCACHE -->|"Online retrieval"| ONF
+
+    %% MLflow interactions
+    ML -->|"log_model()"| MINIO
+    ML -->|"log_params/metrics"| PGDB3
+    MINIO -->|"load_model()"| INF
+    PGDB3 -.-> MLU
+    PGDB1 -.-> FEU
+    MINIO -.-> MIU
+
+    %% Styles
+    style DS fill:#dbeafe,stroke:#3b82f6,color:#1e3a5f
+    style KF fill:#ffedd5,stroke:#f97316,color:#7c2d12
+    style ETL fill:#dcfce7,stroke:#22c55e,color:#14532d
+    style PG fill:#e0e7ff,stroke:#6366f1,color:#312e81
+    style REDIS fill:#fee2e2,stroke:#ef4444,color:#7f1d1d
+    style MINIO fill:#fef9c3,stroke:#eab308,color:#713f12
+    style FEAST fill:#f3e8ff,stroke:#a855f7,color:#581c87
+    style TRAIN fill:#dbeafe,stroke:#3b82f6,color:#1e3a5f
+    style SERVE fill:#dcfce7,stroke:#22c55e,color:#14532d
+    style UI fill:#fef9c3,stroke:#eab308,color:#713f12
