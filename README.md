@@ -1,4 +1,4 @@
-# MLOps Pipeline — Anomaly Detection
+# MLOps Pipeline: Anomaly Detection
 
 Credit card transaction anomaly detection using **Feast** (Feature Store) + **MLflow** (Experiment Tracking) + **PyTorch Autoencoder**, deployed on-premise with production-grade infrastructure.
 
