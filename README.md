@@ -1,4 +1,4 @@
-# MLOps Pipeline: Anomaly Detection
+# MLOps Pipeline — Anomaly Detection
 
 Credit card transaction anomaly detection using **Feast** (Feature Store) + **MLflow** (Experiment Tracking) + **PyTorch Autoencoder**, deployed on-premise with production-grade infrastructure.
 
@@ -251,119 +251,117 @@ curl http://localhost:5001/health
 
 ## Known Limitations & Weaknesses
 
-> Phần này phân tích các điểm yếu hiện tại của flow, giúp người triển khai đánh giá rủi ro và lên kế hoạch cải thiện.
+### 1. Security: Hardcoded Credentials
 
-### 1. Security — Hardcoded Credentials
-
-| Vấn đề | Vị trí |
-|--------|--------|
+| Issue | Location |
+|-------|----------|
 | PostgreSQL password `mlops_secret` | `docker-compose.yml`, `feature_store.yaml`, `train.py`, `serve.py`, `kafka_consumer.py` |
 | MinIO credentials `mlops_minio` / `mlops_minio_secret` | `docker-compose.yml`, `train.py`, `serve.py`, `Makefile` |
 
-**Rủi ro**: Credentials nằm trực tiếp trong source code. Nếu push lên public repo, toàn bộ hệ thống bị lộ.
+**Risk**: Credentials are hardcoded directly in source code. If pushed to a public repo, the entire system is exposed.
 
-**Khuyến nghị**: Sử dụng `.env` file (gitignored), Docker secrets, hoặc HashiCorp Vault. Tất cả credentials nên được đọc từ environment variables.
-
----
-
-### 2. Data Pipeline — Không có tính Idempotent & Scale kém
-
-| Vấn đề | Chi tiết |
-|--------|----------|
-| **`if_exists="replace"`** | `kafka_consumer.py` ghi đè toàn bộ bảng `transactions` và `customer_profiles` mỗi lần chạy. Dữ liệu lịch sử bị mất hoàn toàn. |
-| **Không có deduplication** | Kafka consumer dùng `group_id=None` + `auto_offset_reset="earliest"`, mỗi lần chạy đọc lại toàn bộ messages → dữ liệu trùng lặp nếu producer chạy nhiều lần. |
-| **Chỉ 20 transactions** | Producer mặc định tạo 20 records với 5% anomaly ≈ 1 anomaly. Quá ít để model học được pattern có ý nghĩa thống kê. |
-| **Không có schema validation** | Consumer không validate schema của messages từ Kafka. Nếu producer thay đổi format, pipeline fail không kiểm soát. |
-| **Batch-only ETL** | Không có streaming consumer (chạy liên tục). Mỗi lần cần data mới phải chạy lại `make ingest` thủ công. |
+**Recommendation**: Use `.env` files (gitignored), Docker secrets, or HashiCorp Vault. All credentials should be read from environment variables.
 
 ---
 
-### 3. Feature Store — Training-Serving Skew tiềm ẩn
+### 2. Data Pipeline: Not Idempotent & Poor Scalability
 
-| Vấn đề | Chi tiết |
-|--------|----------|
-| **Customer profiles tính sai** | `compute_customer_profiles()` tính aggregation trên toàn bộ dataset hiện tại, không phải sliding window 30 ngày thực sự. Tên feature `*_30d` gây hiểu lầm. |
-| **Materialize thủ công** | Không có job scheduler (cron, Airflow) để tự động `materialize-incremental`. Online store có thể stale. |
-| **Feature freshness không được monitor** | Không có cách biết features trong Redis đã cũ bao lâu. Serving có thể trả kết quả dựa trên features quá hạn. |
-
----
-
-### 4. Model Training — Thiếu rigor cho Production
-
-| Vấn đề | Chi tiết |
-|--------|----------|
-| **Không có train/validation/test split** | Toàn bộ data dùng cho cả training và evaluation. AUC, F1 bị inflated, không phản ánh khả năng generalize. |
-| **Threshold = 95th percentile trên toàn bộ data** | Threshold được tính trên cả training data, tạo data leakage. Nên tính trên validation set riêng. |
-| **Không có hyperparameter tuning** | Encoding dim, epochs, learning rate, batch size đều hardcoded. Không có grid search, random search, hay Optuna. |
-| **Không có early stopping** | Model luôn train đủ 50 epochs. Có thể overfit hoặc lãng phí compute. |
-| **Label join logic mong manh** | Labels merge bằng `customer_id` (many-to-many). Nếu 1 customer có cả normal và anomaly transactions, label bị gán sai cho một số rows. |
+| Issue | Details |
+|-------|----------|
+| **`if_exists="replace"`** | `kafka_consumer.py` overwrites the entire `transactions` and `customer_profiles` tables on every run. Historical data is completely lost. |
+| **No deduplication** | Kafka consumer uses `group_id=None` + `auto_offset_reset="earliest"`, re-reading all messages on every run → duplicate data if the producer runs multiple times. |
+| **Only 20 transactions** | Producer defaults to 20 records with 5% anomaly ≈ 1 anomaly. Too few for the model to learn statistically meaningful patterns. |
+| **No schema validation** | Consumer does not validate message schemas from Kafka. If the producer changes format, the pipeline fails uncontrollably. |
+| **Batch-only ETL** | No streaming consumer (continuously running). Every time new data is needed, `make ingest` must be re-run manually. |
 
 ---
 
-### 5. Model Serving — Chưa sẵn sàng Production
+### 3. Feature Store: Potential Training-Serving Skew
 
-| Vấn đề | Chi tiết |
-|--------|----------|
-| **Flask development server** | `app.run(debug=False)` vẫn là Flask's built-in server, single-threaded, không handle concurrent requests tốt. Production cần Gunicorn/uWSGI + Nginx. |
-| **Không có authentication/authorization** | API `/predict` mở hoàn toàn, ai cũng có thể gọi. Thiếu API key, JWT, hoặc rate limiting. |
-| **Không có input validation đầy đủ** | Chỉ check `customer_id` và `amount`. Không validate `transaction_hour` (0-23), `transaction_day_of_week` (0-6), kiểu dữ liệu, hoặc giá trị âm. |
-| **Scaler/threshold load từ local file** | `serve.py` đọc `scaler.pkl` và `threshold.pkl` từ `mlflow/artifacts/` local thay vì download từ MLflow/MinIO. Nếu deploy trên server khác, file không tồn tại. |
-| **Không có model versioning logic** | Luôn load `latest` version. Không có canary deployment, A/B testing, hay rollback mechanism. |
-| **Không có graceful shutdown** | `pkill -f serve.py` trong Makefile là brute-force. Không đảm bảo in-flight requests được xử lý xong. |
+| Issue | Details |
+|-------|----------|
+| **Customer profiles computed incorrectly** | `compute_customer_profiles()` computes aggregations over the entire current dataset, not an actual 30-day sliding window. The `*_30d` feature names are misleading. |
+| **Manual materialization** | No job scheduler (cron, Airflow) to automate `materialize-incremental`. The online store can become stale. |
+| **Feature freshness not monitored** | No way to know how stale features in Redis are. Serving may return results based on expired features. |
 
 ---
 
-### 6. Monitoring & Observability — Gần như không có
+### 4. Model Training: Lacks Production Rigor
 
-| Vấn đề | Chi tiết |
-|--------|----------|
-| **Không có prediction logging** | Serving API không log predictions. Không thể audit, debug False Positive/Negative, hay tính model accuracy trên production data. |
-| **Không có data drift detection** | Không monitor sự thay đổi phân phối của input features theo thời gian. Model có thể degraded mà không ai biết. |
-| **Không có model performance monitoring** | Không có feedback loop: khi anomaly bị phát hiện, không có cách xác nhận nó đúng hay sai để retrain. |
-| **Không có alerting** | Nếu serving API down, Kafka lag, hoặc Redis stale — không có alert nào được gửi. |
-| **Không có health check sâu** | `/health` chỉ check model loaded. Không verify kết nối tới Redis, PostgreSQL, hay model prediction quality. |
-
----
-
-### 7. Infrastructure — Thiếu Reliability
-
-| Vấn đề | Chi tiết |
-|--------|----------|
-| **`sleep 15` thay cho health check** | `make infra-up` dùng `sleep 15` cố định thay vì polling health endpoints. Trên máy chậm, services có thể chưa ready. |
-| **Single node, no replication** | Kafka 1 broker, PostgreSQL 1 instance, Redis 1 instance. Bất kỳ service nào fail = toàn bộ pipeline down. |
-| **Không có backup strategy** | PostgreSQL data (Feast registry, offline store, MLflow metadata) không có backup schedule. Volume mất = mất toàn bộ. |
-| **Docker volumes không có retention policy** | Volumes grow vô hạn. Không có cleanup cho old MLflow runs, stale features, hay Kafka logs. |
+| Issue | Details |
+|-------|----------|
+| **No train/validation/test split** | All data is used for both training and evaluation. AUC, F1 are inflated and do not reflect generalization ability. |
+| **Threshold = 95th percentile on entire data** | Threshold is computed on training data, creating data leakage. Should be computed on a separate validation set. |
+| **No hyperparameter tuning** | Encoding dim, epochs, learning rate, batch size are all hardcoded. No grid search, random search, or Optuna. |
+| **No early stopping** | Model always trains for the full 50 epochs. May overfit or waste compute. |
+| **Fragile label join logic** | Labels are merged by `customer_id` (many-to-many). If a customer has both normal and anomaly transactions, labels are incorrectly assigned to some rows. |
 
 ---
 
-### 8. Testing — Coverage thấp
+### 5. Model Serving: Not Production-Ready
 
-| Vấn đề | Chi tiết |
-|--------|----------|
-| **Chỉ có E2E test** | Không có unit tests cho `autoencoder.py`, `kafka_consumer.py`, `train.py`. Bug trong transform/training logic chỉ phát hiện khi chạy full pipeline. |
-| **E2E test không assert anomaly detection chính xác** | `test_anomalous_transaction()` chỉ check response format, không assert `is_anomaly == True`. Không phát hiện nếu model completely broken. |
-| **Không có integration test cho Feast** | Không test point-in-time join correctness, feature freshness, hay online/offline consistency. |
-| **Không dùng pytest** | Test framework tự viết bằng try/except. Thiếu fixtures, parametrize, coverage report, CI integration. |
+| Issue | Details |
+|-------|----------|
+| **Flask development server** | `app.run(debug=False)` still uses Flask's built-in server, single-threaded, which does not handle concurrent requests well. Production requires Gunicorn/uWSGI + Nginx. |
+| **No authentication/authorization** | The `/predict` API is completely open; anyone can call it. Missing API key, JWT, or rate limiting. |
+| **Incomplete input validation** | Only checks `customer_id` and `amount`. Does not validate `transaction_hour` (0-23), `transaction_day_of_week` (0-6), data types, or negative values. |
+| **Scaler/threshold loaded from local files** | `serve.py` reads `scaler.pkl` and `threshold.pkl` from local `mlflow/artifacts/` instead of downloading from MLflow/MinIO. If deployed on a different server, the files won't exist. |
+| **No model versioning logic** | Always loads the `latest` version. No canary deployment, A/B testing, or rollback mechanism. |
+| **No graceful shutdown** | `pkill -f serve.py` in Makefile is brute-force. Does not guarantee in-flight requests are completed. |
+
+---
+
+### 6. Monitoring & Observability: Nearly Non-Existent
+
+| Issue | Details |
+|-------|----------|
+| **No prediction logging** | Serving API does not log predictions. Cannot audit, debug False Positives/Negatives, or calculate model accuracy on production data. |
+| **No data drift detection** | Does not monitor changes in input feature distributions over time. Model may degrade without anyone knowing. |
+| **No model performance monitoring** | No feedback loop: when an anomaly is detected, there is no way to confirm whether it is correct or incorrect for retraining. |
+| **No alerting** | If the serving API goes down, Kafka lags, or Redis becomes stale — no alerts are sent. |
+| **No deep health checks** | `/health` only checks if the model is loaded. Does not verify connections to Redis, PostgreSQL, or model prediction quality. |
+
+---
+
+### 7. Infrastructure: Lacks Reliability
+
+| Issue | Details |
+|-------|----------|
+| **`sleep 15` instead of health checks** | `make infra-up` uses a fixed `sleep 15` instead of polling health endpoints. On slower machines, services may not be ready yet. |
+| **Single node, no replication** | Kafka 1 broker, PostgreSQL 1 instance, Redis 1 instance. Any single service failure = entire pipeline goes down. |
+| **No backup strategy** | PostgreSQL data (Feast registry, offline store, MLflow metadata) has no backup schedule. If volumes are lost = everything is lost. |
+| **No retention policy for Docker volumes** | Volumes grow indefinitely. No cleanup for old MLflow runs, stale features, or Kafka logs. |
+
+---
+
+### 8. Testing: Low Coverage
+
+| Issue | Details |
+|-------|----------|
+| **Only E2E tests** | No unit tests for `autoencoder.py`, `kafka_consumer.py`, `train.py`. Bugs in transform/training logic are only discovered when running the full pipeline. |
+| **E2E test does not assert anomaly detection accuracy** | `test_anomalous_transaction()` only checks response format, does not assert `is_anomaly == True`. Does not detect if the model is completely broken. |
+| **No integration tests for Feast** | Does not test point-in-time join correctness, feature freshness, or online/offline consistency. |
+| **Does not use pytest** | Test framework is hand-written with try/except. Lacks fixtures, parametrize, coverage reports, and CI integration. |
 
 ---
 
 ### 9. Reproducibility
 
-| Vấn đề | Chi tiết |
-|--------|----------|
-| **Random seed không được set** | `kafka_producer.py` dùng `random` module không seed. Mỗi lần chạy tạo data khác nhau → kết quả training không reproducible. |
-| **Không pin Docker image tags** | `minio/minio:latest` và `minio/mc:latest` thay đổi theo thời gian. Build hôm nay và build ngày mai có thể khác nhau. |
-| **PyTorch không set seed** | `train.py` không set `torch.manual_seed()`. Cùng data nhưng model weights khác nhau mỗi lần train. |
+| Issue | Details |
+|-------|----------|
+| **Random seed not set** | `kafka_producer.py` uses the `random` module without seeding. Each run generates different data → training results are not reproducible. |
+| **Docker image tags not pinned** | `minio/minio:latest` and `minio/mc:latest` change over time. Today's build and tomorrow's build may differ. |
+| **PyTorch seed not set** | `train.py` does not set `torch.manual_seed()`. Same data but different model weights on each training run. |
 
 ---
 
-### Tóm tắt mức độ ưu tiên
+### Priority Summary
 
-| Ưu tiên | Hạng mục | Lý do |
-|---------|----------|-------|
-| 🔴 **Cao** | Security (credentials), Train/test split, Flask production server | Ảnh hưởng trực tiếp đến bảo mật và độ tin cậy của model |
-| 🟡 **Trung bình** | Idempotent pipeline, Monitoring, Input validation, Artifact loading | Gây lỗi khi scale hoặc deploy trên môi trường khác |
-| 🟢 **Thấp** | Reproducibility, Backup, Testing framework | Quan trọng dài hạn nhưng không block MVP |
+| Priority | Category | Reason |
+|----------|----------|--------|
+| **High** | Security (credentials), Train/test split, Flask production server | Directly affects security and model reliability |
+| **Medium** | Idempotent pipeline, Monitoring, Input validation, Artifact loading | Causes failures when scaling or deploying to different environments |
+| **Low** | Reproducibility, Backup, Testing framework | Important long-term but does not block MVP |
 
 ---
 
